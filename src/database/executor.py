@@ -89,52 +89,262 @@ class TableIntrospector:
                 db_connection.release_connection(conn)
     
     @staticmethod
-    def get_table_schema(table_name: str,
+    def get_table_schema(table_name: str, database: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get schema for a specific table"""
+        conn = None
+        try:
+            conn = db_connection.get_connection(database)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    column_name,
+                    data_type,
+                    is_nullable,
+                    column_default
+                FROM information_schema.columns
+                WHERE table_name = %s AND table_schema = 'public'
+                ORDER BY ordinal_position;
+            """, (table_name,))
+            
+            return [
+                {
+                    "name": row[0],
+                    "type": row[1],
+                    "nullable": row[2] == "YES",
+                    "default": row[3]
+                }
+                for row in cursor.fetchall()
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get table schema: {e}")
+            return []
+        finally:
+            if conn:
+                db_connection.release_connection(conn)
+    
+    @staticmethod
+    def find_similar_tables(table_name: str, available_tables: List[str]) -> Optional[str]:
+        """Find table name most similar using SequenceMatcher"""
+        if not available_tables:
+            return None
+            
+        table_lower = table_name.lower()
+        best_match = None
+        best_ratio = 0.0
+        
+        for t in available_tables:
+            # Calculate similarity ratio
+            ratio = SequenceMatcher(None, table_lower, t.lower()).ratio()
+            
+            # Also check for substring matches
+            if table_lower in t.lower() or t.lower() in table_lower:
+                ratio = max(ratio, 0.8)
+            
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = t
+        
+        # Only return if similarity is above threshold
+        return best_match if best_ratio >= 0.5 else None
+
+
+class SQLRegenerator:
+    """Handles context-aware SQL regeneration"""
+    
+    def __init__(self, llm_client: Any):
+        self.llm = llm_client
+        self.introspector = TableIntrospector()
+    
+    def regenerate_sql(
+        self,
+        user_query: str,
+        failed_sql: str,
+        error: ExecutionError,
+        database: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Regenerate SQL using context-aware approach.
+        
+        Returns:
+            Valid SQL string or None if regeneration fails
+        """
+        try:
+            # Step A: Introspect available tables and schemas
+            available_tables = self.introspector.get_tables(database)
+            
+            # Build context for regeneration
+            context = self._build_context(
+                user_query=user_query,
+                failed_sql=failed_sql,
+                error=error,
+                available_tables=available_tables,
+                database=database
+            )
+            
+            # Step B: Generate new SQL
+            response = self.llm.generate(context)
+            
+            # Step C: Validate output
+            validated_sql = self._validate_sql_output(response)
+            
+            if validated_sql:
+                logger.info(f"SQL regenerated successfully: {validated_sql[:50]}...")
+                return validated_sql
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"SQL regeneration failed: {e}")
+            return None
+    
+    def _build_context(
+        self,
+        user_query: str,
+        failed_sql: str,
+        error: ExecutionError,
+        available_tables: List[str],
+        database: Optional[str]
+    ) -> str:
+        """Build comprehensive context for SQL regeneration"""
+        
+        # Format available tables
+        tables_str = ", ".join(available_tables) if available_tables else "No tables found"
+        
+        # Get schemas for relevant tables if it's a relation error
+        schema_info = ""
+        if error.error_type == "RELATION_NOT_EXISTS" and error.relation_name:
+            # Try to get schema for similar tables
+            similar = TableIntrospector.find_similar_tables(error.relation_name, available_tables)
+            if similar:
+                schema = self.introspector.get_table_schema(similar, database)
+                if schema:
+                    cols = [f"{c['name']} ({c['type']})" for c in schema]
+                    schema_info = f"\n\nSchema for '{similar}' (possible match): {', '.join(cols)}"
+        
+        db_name = database or db_connection.get_active_database() or "current"
+        
+        prompt = f"""You are a PostgreSQL expert. Generate a new SQL query from scratch based on the user's original request.
+
+ORIGINAL USER REQUEST:
+{user_query}
+
+PREVIOUS FAILED SQL:
+{failed_sql}
+
+ERROR MESSAGE:
+{error.error_message}
+Error Type: {error.error_type}
+
+DATABASE: {db_name}
+
+AVAILABLE TABLES:
+{tables_str}
+{schema_info}
+
+INSTRUCTIONS:
+1. Generate a new SQL query from SCRATCH based on the original user request
+2. Use the available tables to construct the query
+3. If the original table doesn't exist, try similar table names
+4. Return ONLY valid SQL - no explanations, no comments, no markdown
+5. Single statement only
+6. Use proper PostgreSQL syntax
+
+SQL QUERY:"""
+        
+        return prompt
+    
+    def _validate_sql_output(self, response: str) -> Optional[str]:
+        """
+        Validate that the LLM output is actually SQL.
+        
+        Returns:
+            Valid SQL string or None if invalid
+        """
+        if not response:
+            return None
+        
+        # Clean the response
+        sql = response.strip()
+        
+        # Remove markdown code blocks
+        if "```" in sql:
+            match = re.search(r'```(?:sql)?\s*(.*?)\s*```', sql, re.DOTALL)
+            if match:
+                sql = match.group(1).strip()
+        
+        # Check for SQL keywords at start
+        sql_keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'TRUNCATE', 'WITH']
+        sql_upper = sql.upper().strip()
+        
+        has_keyword = any(sql_upper.startswith(kw) for kw in sql_keywords)
+        if not has_keyword:
+            logger.warning(f"LLM output does not start with SQL keyword: {sql[:100]}")
+            return None
+        
+        # Check for natural language sentences (heuristics)
+        # If it contains multiple sentences with periods, likely not pure SQL
+        sentences = sql.split('.')
+        if len(sentences) > 3:
+            # More than 3 sentences likely contains explanations
+            # But allow for simple queries
+            first_part = sentences[0].lower()
+            if not any(first_part.startswith(kw.lower()) for kw in sql_keywords):
+                logger.warning(f"LLM output appears to contain natural language: {sql[:100]}")
+                return None
+        
+        # Check for common non-SQL patterns
+        bad_patterns = [
+            r'^here\'s',
+            r'^sure,',
+            r'^of course',
+            r'^the query',
+            r'^based on',
+            r'^to fix',
+        ]
+        for pattern in bad_patterns:
+            if re.match(pattern, sql_lower := sql.lower()):
+                logger.warning(f"LLM output appears to be natural language: {sql[:100]}")
+                return None
+        
+        # Validate length - must be substantial
+        if len(sql) < 10:
+            return None
+        
+        return sql
+
+
+class QueryExecutor:
+    """Handles SQL query execution with intelligent context-aware regeneration"""
+    
+    def __init__(self):
+        self.enable_intelligent_retry = settings.ENABLE_INTELLIGENT_RETRY
+        self.suggest_available_tables = settings.SUGGEST_AVAILABLE_TABLES
+        self.log_sql_repairs = settings.LOG_SQL_REPAIRS
+        self.max_regeneration_attempts = 2  # Max 2 regeneration tries
+    
+    def execute_query(
         self, 
         sql: str, 
         database: Optional[str] = None,
         params: Optional[Tuple] = None,
         with_retry: bool = True
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """
-        Execute a SQL query and return results
-        
-        Args:
-            sql: SQL query to execute
-            database: Target database (optional)
-            params: Query parameters (optional)
-            with_retry: Whether to use intelligent retry logic
-            
-        Returns:
-            Tuple of (rows, column_names)
-        """
+        """Execute a SQL query and return results"""
         conn = None
         try:
             conn = db_connection.get_connection(database)
             cursor = conn.cursor()
             
-            # Execute with parameters if provided
             if params:
                 cursor.execute(sql, params)
             else:
                 cursor.execute(sql)
             
-            # Get column names
             column_names = [desc[0] for desc in cursor.description] if cursor.description else []
-            
-            # Fetch all results
             rows = cursor.fetchall()
+            results = [dict(zip(column_names, row)) for row in rows]
             
-            # Convert to list of dicts
-            results = []
-            for row in rows:
-                results.append(dict(zip(column_names, row)))
-            
-            # Commit for modification queries
-            if sql.strip().upper().startswith((
-                "INSERT", "UPDATE", "DELETE", "CREATE", 
-                "DROP", "ALTER", "TRUNCATE"
-            )):
+            if sql.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE")):
                 conn.commit()
             
             logger.info(f"Query executed successfully, returned {len(results)} rows")
@@ -143,12 +353,8 @@ class TableIntrospector:
         except Exception as e:
             if conn:
                 conn.rollback()
-            
-            # Create structured error
             error = ExecutionError(e, sql)
             logger.error(f"Query execution failed: {error.error_type} - {error.error_message}")
-            
-            # Re-raise to let caller handle retry logic
             raise
             
         finally:
@@ -160,231 +366,198 @@ class TableIntrospector:
         sql: str,
         database: Optional[str] = None,
         llm_client: Optional[Any] = None,
+        user_query: str = None,
         max_retries: int = None
     ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[str]], str]:
         """
-        Execute SQL with intelligent error handling and LLM-based repair.
+        Execute SQL with context-aware regeneration on failure.
         
         Args:
             sql: SQL query to execute
             database: Target database
-            llm_client: LLM client for SQL repair
-            max_retries: Maximum retry attempts
+            llm_client: LLM client for SQL regeneration
+            user_query: Original natural language query (for context)
+            max_retries: Max regeneration attempts
             
         Returns:
-            Tuple of (results, columns, final_sql_or_error_message)
+            Tuple of (results, columns, final_sql_or_error)
         """
         if max_retries is None:
-            max_retries = settings.MAX_EXECUTION_RETRIES
+            max_retries = self.max_regeneration_attempts
+        
+        # Use the user query for context if not provided
+        original_user_query = user_query or "Generate SQL for the user's request"
         
         current_sql = sql
-        available_tables: List[str] = []
+        target_db = database or db_connection.get_active_database()
         
+        # First attempt - try executing original SQL
+        try:
+            results, columns = self.execute_query(current_sql, target_db)
+            return results, columns, current_sql
+        except Exception as initial_error:
+            initial_execution_error = ExecutionError(initial_error, current_sql)
+            
+            # Check if error is retryable
+            if not self._is_retryable_error(initial_execution_error):
+                return None, None, self._format_error_message(initial_execution_error, target_db)
+        
+        # Regeneration loop
         for attempt in range(max_retries):
+            logger.info(f"Regeneration attempt {attempt + 1}")
+            
+            # Step A: Get available tables for context
+            available_tables = []
+            if self.suggest_available_tables:
+                available_tables = TableIntrospector.get_tables(target_db)
+            
+            # Step B: Regenerate SQL using context
+            if not llm_client:
+                return None, None, self._format_error_message(initial_execution_error, target_db, available_tables)
+            
+            regenerator = SQLRegenerator(llm_client)
+            
+            # Capture original error info
+            error = initial_execution_error if attempt == 0 else ExecutionError(
+                Exception("Regenerated SQL still failed"), current_sql
+            )
+            
+            new_sql = regenerator.regenerate_sql(
+                user_query=original_user_query,
+                failed_sql=current_sql,
+                error=error,
+                database=target_db
+            )
+            
+            if not new_sql:
+                # Regeneration failed - return error with available tables
+                return None, None, self._format_error_message(
+                    initial_execution_error, 
+                    target_db, 
+                    available_tables,
+                    user_query=original_user_query
+                )
+            
+            # Validate regenerated SQL
+            if not self._validate_before_execution(new_sql):
+                return None, None, self._format_error_message(
+                    initial_execution_error,
+                    target_db,
+                    available_tables,
+                    user_query=original_user_query,
+                    reason="Regenerated SQL failed validation"
+                )
+            
+            current_sql = new_sql
+            
+            # Try executing regenerated SQL
             try:
-                # Determine target database
-                target_db = database or db_connection.get_active_database()
+                results, columns = self.execute_query(current_sql, target_db)
                 
-                # Execute the query
-                results, columns = self.execute_query(current_sql, target_db, with_retry=False)
+                if self.log_sql_repairs:
+                    logger.info(f"SQL regenerated: {sql[:50]}... -> {current_sql[:50]}...")
+                
                 return results, columns, current_sql
                 
-            except Exception as e:
-                error = ExecutionError(e, current_sql)
+            except Exception as exec_error:
+                error = ExecutionError(exec_error, current_sql)
+                logger.info(f"Regenerated SQL failed: {error.error_type}")
                 
-                logger.info(f"Attempt {attempt + 1} failed with: {error.error_type}")
+                # Update error for next iteration
+                initial_execution_error = error
                 
-                # Check if this error type is retryable
-                if not self.enable_intelligent_retry or not self._is_retryable_error(error):
-                    # Return error message
-                    return None, None, self._format_error_message(error, available_tables)
-                
-                # If relation not exists, get available tables for suggestion
-                if error.error_type == "RELATION_NOT_EXISTS" and self.suggest_available_tables:
-                    try:
-                        target_db = database or db_connection.get_active_database()
-                        available_tables = self._get_available_tables(target_db)
-                    except:
-                        pass
-                
-                # Try to repair SQL using LLM
-                if llm_client and attempt < max_retries - 1:
-                    repair_result = self._repair_sql(
-                        current_sql, 
-                        error, 
-                        llm_client,
-                        available_tables
-                    )
-                    
-                    if repair_result:
-                        current_sql = repair_result
-                        
-                        if self.log_sql_repairs:
-                            logger.info(f"SQL repaired: {sql[:50]}... -> {current_sql[:50]}...")
-                        
-                        continue  # Retry with repaired SQL
-                
-                # No more retries or no LLM client
-                if attempt == max_retries - 1:
-                    return None, None, self._format_error_message(error, available_tables)
+                # If not retryable, stop
+                if not self._is_retryable_error(error):
+                    return None, None, self._format_error_message(error, target_db, available_tables)
         
-        return None, None, "Max retries exceeded"
+        # Max retries exceeded
+        return None, None, self._format_error_message(
+            initial_execution_error,
+            target_db,
+            available_tables,
+            user_query=original_user_query,
+            reason="Max regeneration attempts exceeded"
+        )
+    
+    def _validate_before_execution(self, sql: str) -> bool:
+        """Validate SQL before attempting execution"""
+        if not sql:
+            return False
+        
+        sql_upper = sql.strip().upper()
+        
+        # Must start with SQL keyword
+        sql_keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'TRUNCATE', 'WITH']
+        if not any(sql_upper.startswith(kw) for kw in sql_keywords):
+            return False
+        
+        # Use sqlglot for validation
+        try:
+            import sqlglot
+            parsed = sqlglot.parse(sql, dialect="postgres")
+            return parsed is not None and len(parsed) > 0
+        except:
+            # If sqlglot fails, do basic check
+            return len(sql) > 10
     
     def _is_retryable_error(self, error: ExecutionError) -> bool:
-        """Check if error type should trigger retry with repair"""
-        retryable_types = [
-            "RELATION_NOT_EXISTS",
-            "COLUMN_NOT_EXISTS", 
-            "SYNTAX_ERROR"
-        ]
+        """Check if error type allows regeneration"""
+        retryable_types = ["RELATION_NOT_EXISTS", "COLUMN_NOT_EXISTS", "SYNTAX_ERROR"]
         return error.error_type in retryable_types
     
-    def _repair_sql(
-        self,
-        original_sql: str,
-        error: ExecutionError,
-        llm_client: Any,
-        available_tables: List[str] = None
-    ) -> Optional[str]:
-        """Use LLM to repair SQL based on error message"""
-        try:
-            # Build repair prompt
-            tables_info = ""
-            if available_tables:
-                tables_info = f"\nAvailable tables in database: {', '.join(available_tables)}"
-            
-            prompt = f"""You are a PostgreSQL expert. The following SQL query failed with an error.
-
-Original SQL:
-```sql
-{original_sql}
-```
-
-Error: {error.error_message}
-Error Type: {error.error_type}
-{tables_info}
-
-Instructions:
-1. Analyze the error and the SQL query
-2. Fix the SQL to resolve the error
-3. Only return the corrected SQL query, nothing else
-4. If the table doesn't exist but there's a similar available table, use that table name
-5. Use proper PostgreSQL syntax
-
-Corrected SQL:"""
-            
-            # Get LLM response
-            response = llm_client.generate(prompt)
-            
-            # Extract SQL from response
-            if hasattr(self, '_extract_sql_from_response'):
-                repaired_sql = self._extract_sql_from_response(response)
-            else:
-                # Simple extraction
-                repaired_sql = response.strip()
-                # Remove markdown code blocks if present
-                if "```" in repaired_sql:
-                    match = re.search(r'```(?:sql)?\s*(.*?)\s*```', repaired_sql, re.DOTALL)
-                    if match:
-                        repaired_sql = match.group(1).strip()
-            
-            # Validate repaired SQL looks reasonable
-            if repaired_sql and len(repaired_sql) > 10:
-                return repaired_sql
-            
-        except Exception as e:
-            logger.error(f"Failed to repair SQL: {e}")
-        
-        return None
-    
-    def _extract_sql_from_response(self, response: str) -> str:
-        """Extract SQL from LLM response"""
-        # Try code blocks first
-        match = re.search(r'```(?:sql)?\s*(.*?)\s*```', response, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        
-        # Try to find SQL starting with keyword
-        sql_keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'TRUNCATE']
-        for keyword in sql_keywords:
-            pattern = rf'\b{keyword}\b'
-            match = re.search(pattern, response, re.IGNORECASE)
-            if match:
-                return response[match.start():].strip()
-        
-        return response.strip()
-    
-    def _get_available_tables(self, database: Optional[str] = None) -> List[str]:
-        """Get list of available tables in database"""
-        try:
-            conn = None
-            conn = db_connection.get_connection(database)
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                ORDER BY table_name;
-            """)
-            tables = [row[0] for row in cursor.fetchall()]
-            return tables
-        except Exception as e:
-            logger.error(f"Failed to get available tables: {e}")
-            return []
-        finally:
-            if conn:
-                db_connection.release_connection(conn)
-    
     def _format_error_message(
-        self, 
+        self,
         error: ExecutionError,
-        available_tables: List[str] = None
+        database: Optional[str],
+        available_tables: List[str] = None,
+        user_query: str = None,
+        reason: str = None
     ) -> str:
-        """Format error into user-friendly message"""
-        msg = error.error_message
+        """Format comprehensive error message with context"""
+        db_name = database or db_connection.get_active_database() or "current"
         
-        # Add relation suggestion
-        if error.relation_name and available_tables:
-            # Find similar table names
-            similar = self._find_similar_tables(error.relation_name, available_tables)
-            if similar:
-                msg += f"\n\nAvailable tables: {', '.join(available_tables[:10])}"
-                if similar != error.relation_name:
-                    msg += f"\nDid you mean '{similar}'?"
+        msg_parts = []
         
-        # Add column suggestion
-        if error.column_name and error.get_suggestion():
-            msg += f"\n\n{error.get_suggestion()}"
+        # Add reason if provided
+        if reason:
+            msg_parts.append(f"Error: {reason}")
         
-        return msg
+        # Add specific error information
+        if error.error_type == "RELATION_NOT_EXISTS":
+            table_name = error.relation_name or "unknown"
+            msg_parts.append(f"Table '{table_name}' does not exist in database '{db_name}'.")
+            
+            # Find similar tables
+            if available_tables:
+                similar = TableIntrospector.find_similar_tables(table_name, available_tables)
+                if similar and similar.lower() != table_name.lower():
+                    msg_parts.append(f"Did you mean '{similar}'?")
+                msg_parts.append(f"\nAvailable tables: {', '.join(available_tables[:10])}")
+                
+        elif error.error_type == "COLUMN_NOT_EXISTS":
+            col_name = error.column_name or "unknown"
+            table_from_sql = self._extract_table_from_sql(error.sql)
+            msg_parts.append(f"Column '{col_name}' not found.")
+            if table_from_sql:
+                msg_parts.append(f"In table '{table_from_sql}'.")
+                
+        else:
+            msg_parts.append(error.error_message)
+        
+        return "\n".join(msg_parts)
     
-    def _find_similar_tables(
-        self, 
-        table_name: str, 
-        available_tables: List[str]
-    ) -> Optional[str]:
-        """Find table name most similar to the requested one"""
-        table_lower = table_name.lower()
-        
-        # Exact match (case insensitive)
-        for t in available_tables:
-            if t.lower() == table_lower:
-                return t
-        
-        # Partial match
-        for t in available_tables:
-            if table_lower in t.lower() or t.lower() in table_lower:
-                return t
-        
-        # Levenshtein-like: check for common typos
-        # Simple approach: check first char matches and high similarity
-        for t in available_tables:
-            if t.lower().startswith(table_lower[0]) and len(table_lower) > 2:
-                # Simple similarity check
-                matches = sum(1 for a, b in zip(t.lower(), table_lower) if a == b)
-                if matches >= len(table_lower) * 0.6:
-                    return t
-        
+    def _extract_table_from_sql(self, sql: str) -> Optional[str]:
+        """Extract table name from SQL query"""
+        # Simple extraction - look for FROM or UPDATE
+        patterns = [
+            r'FROM\s+(\w+)',
+            r'UPDATE\s+(\w+)',
+            r'INTO\s+(\w+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, sql, re.IGNORECASE)
+            if match:
+                return match.group(1)
         return None
     
     def execute_single(
