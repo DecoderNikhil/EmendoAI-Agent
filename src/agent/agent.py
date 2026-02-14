@@ -2,6 +2,7 @@
 Main EmendoAI Agent
 Ties all components together and handles the full flow
 """
+import re
 from typing import Tuple, Optional, List, Dict, Any
 import logging
 
@@ -10,7 +11,7 @@ from src.llm.anthropic_client import ClaudeClient
 from src.llm.bedrock_client import BedrockClient
 from src.llm.cli_client import CLIClaudeClient
 from src.database.introspection import schema_introspector
-from src.database.executor import query_executor
+from src.database.executor import query_executor, SQLValidator, SYSTEM_TABLES
 from src.database.connection import db_connection
 from src.sql.validator import sql_validator
 from src.agent.prompt_builder import prompt_builder
@@ -21,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 def _create_llm_client():
-    """Create the appropriate LLM client based on settings"""
     if settings.USE_CLAUDE_CLI:
         return CLIClaudeClient()
     if settings.USE_BEDROCK:
@@ -71,6 +71,28 @@ class EmendoAIAgent:
         self.conversation_history: List[Dict[str, str]] = []
         self.enable_intelligent_retry = settings.ENABLE_INTELLIGENT_RETRY
     
+    def _extract_database_from_query(self, user_query: str) -> Optional[str]:
+        """Extract database name from query like 'count films in dvdrental'"""
+        normalized = user_query.lower()
+        
+        # Patterns to extract database name
+        patterns = [
+            r'in\s+(\S+)',                    # in dvdrental
+            r'from\s+(\S+)_database',        # from dvdrental_database
+            r'using\s+(\S+)',                 # using dvdrental
+            r'database\s+(\S+)',              # database dvdrental
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                db_name = match.group(1).strip()
+                # Clean up common trailing words
+                db_name = re.sub(r'\s+(table|tables|query)$', '', db_name)
+                return db_name
+        
+        return None
+    
     def process_query(
         self, 
         user_query: str,
@@ -83,6 +105,17 @@ class EmendoAIAgent:
         special_response = self._handle_special_command(user_query, database)
         if special_response:
             return special_response
+        
+        # Check if database is mentioned in query
+        db_from_query = self._extract_database_from_query(user_query)
+        
+        # If database specified in query, find and switch to it
+        if db_from_query and not database:
+            found_db = self.introspector.find_database(db_from_query)
+            if found_db:
+                db_connection.set_active_database(found_db)
+                self.current_database = found_db
+                logger.info(f"Switched to database from query: {found_db}")
         
         # Determine target database
         target_db = database or self.current_database
@@ -104,14 +137,62 @@ class EmendoAIAgent:
             permission_msg = self.safety.format_permission_message(sql)
             return f"{permission_msg}\n\nGenerated SQL:\n```sql\n{sql}\n```", sql
         
+        # PART 4: Verify tables exist before execution
+        # Loop to handle cross-database resolution
+        max_verification_attempts = 2
+        for attempt in range(max_verification_attempts):
+            valid, error = self.executor.verify_tables_exist(sql, target_db)
+            
+            if valid:
+                break  # Tables exist, proceed
+                
+            # Table not found - try cross-database resolution
+            match = re.search(r"Tables not found in database '([^']+)':\s*(.+)", error)
+            if not match:
+                break  # Different error, can't resolve
+            
+            table_name = match.group(2).strip()
+            matches = self.introspector.find_table_across_all_databases(table_name)
+            
+            if len(matches) == 1:
+                # Found in one database - switch and regenerate
+                found = matches[0]
+                db_connection.set_active_database(found['database'])
+                self.current_database = found['database']
+                logger.info(f"Switched to database: {found['database']} (found table {table_name})")
+                
+                # Regenerate SQL with new database context
+                sql = self._generate_sql(user_query, found['database'])
+                if sql:
+                    target_db = found['database']
+                    logger.info(f"Regenerated SQL for {found['database']}: {sql[:50]}")
+                    # Loop continues to verify again
+                else:
+                    break  # Could not regenerate
+            elif len(matches) > 1:
+                options = "\n".join([f"- {m['database']}" for m in matches])
+                return (
+                    f"Table '{table_name}' exists in multiple databases:\n{options}\n\n"
+                    f"Please specify the database in your query (e.g., 'count {table_name} in <database>')",
+                    sql
+                )
+            else:
+                break  # Table not found anywhere
+        
+        # After verification loop, check if we have a valid query
+        if target_db:
+            valid, error = self.executor.verify_tables_exist(sql, target_db)
+            if not valid:
+                return self._handle_table_not_found_in_sql(error, user_query), sql
+        
         # Check for UPDATE warnings
         needs_warning, warning_msg = self.safety.needs_warning(sql)
         
-        # Execute the query with intelligent retry
+        # Execute the query
         result = self._execute_with_intelligent_retry(sql, target_db, user_query=user_query)
         
         if result is None:
-            return "Query execution failed. Please check the SQL and try again.", sql
+            return "Query execution failed.", sql
         
         if isinstance(result, str):
             return result, sql
@@ -141,22 +222,22 @@ class EmendoAIAgent:
     ) -> Optional[Tuple[str, Optional[str]]]:
         """Handle special commands."""
         
-        # Handle database switch commands
+        # Database switch
         if self.parser.is_database_switch_command(user_query):
             db_name = self.parser.extract_database_name(user_query)
             if db_name:
                 return self._switch_database(db_name)
         
-        # Handle list databases
+        # List databases
         if self.parser.is_list_databases_command(user_query):
             return self._handle_list_databases()
         
-        # Handle list tables (with optional database)
+        # List tables
         if self.parser.is_list_tables_command(user_query):
             db_name = self.parser.extract_database_name(user_query)
             return self._handle_list_tables(db_name)
         
-        # Handle schema commands - search across all databases
+        # Schema command - search across ALL databases
         if self.parser.is_schema_command(user_query):
             table_name = self.parser.extract_table_name_from_schema_command(user_query)
             if table_name:
@@ -165,7 +246,7 @@ class EmendoAIAgent:
         return None
     
     def _handle_list_databases(self) -> Tuple[str, Optional[str]]:
-        """Handle list databases command - exclude system databases."""
+        """PART 1: List databases - exclude system databases."""
         try:
             databases = self.introspector.list_databases(include_system=False)
             current = db_connection.get_active_database()
@@ -184,20 +265,22 @@ class EmendoAIAgent:
             return f"Failed to list databases: {str(e)}", None
     
     def _handle_list_tables(self, database: Optional[str] = None) -> Tuple[str, Optional[str]]:
-        """Handle list tables command - find database and list tables."""
+        """List tables in a database with fuzzy matching."""
         target_db = database or self.current_database
         
-        # If no database specified, ask user to specify one
         if not target_db:
             return "Please specify a database. Use 'list tables in <database>' or switch to a database first.", None
         
-        # Try to find the database with fuzzy matching
+        # Find database with fuzzy matching
         found_db = self.introspector.find_database(target_db)
         if not found_db:
-            # List available databases to help user
             databases = self.introspector.list_databases(include_system=False)
             db_list = "\n".join([f"- {db}" for db in databases])
             return f"Database '{target_db}' not found.\n\nAvailable databases:\n{db_list}", None
+        
+        # Switch to the database
+        db_connection.set_active_database(found_db)
+        self.current_database = found_db
         
         try:
             tables = self.introspector.list_tables(found_db)
@@ -212,30 +295,38 @@ class EmendoAIAgent:
     
     def _handle_show_schema_advanced(self, table_name: str) -> Tuple[str, Optional[str]]:
         """
-        Handle schema command - search across ALL databases and handle ambiguity.
+        PART 2 & 3: Search across ALL databases for table.
+        Handle ambiguity if table exists in multiple databases.
         """
         try:
-            # Search for the table across all databases
+            # Search across all databases
             matches = self.introspector.find_table_across_all_databases(table_name)
             
             if not matches:
-                # Table not found anywhere - show available tables from all databases
                 return self._handle_table_not_found(table_name), None
             
             if len(matches) == 1:
-                # Found in exactly one database - get schema
+                # Found in one database - get schema
                 match = matches[0]
                 return self._get_schema_for_table(match['database'], match['table'])
             
-            # Multiple matches - ask user to clarify
-            return self._ask_which_database(matches, table_name), None
+            # Multiple matches - ask user
+            options = []
+            for i, match in enumerate(matches, 1):
+                options.append(f"{i}. Database: {match['database']}, Table: {match['table']}")
+            
+            options_text = "\n".join(options)
+            return (
+                f"Table '{table_name}' found in multiple databases. Which one do you mean?\n\n"
+                f"{options_text}\n\nPlease specify with 'show schema for <table> in <database>'",
+                None
+            )
             
         except Exception as e:
             return f"Failed to get schema: {str(e)}", None
     
     def _handle_table_not_found(self, table_name: str) -> str:
-        """Show available tables when requested table not found."""
-        # Get tables from all databases
+        """Show available tables from all databases when table not found."""
         all_tables_by_db = {}
         
         try:
@@ -253,7 +344,6 @@ class EmendoAIAgent:
         if not all_tables_by_db:
             return f"Table '{table_name}' not found in any database."
         
-        # Build response
         response = f"Table '{table_name}' not found.\n\nTables by database:\n"
         for db, tables in all_tables_by_db.items():
             response += f"\n{db}:\n"
@@ -263,20 +353,37 @@ class EmendoAIAgent:
         
         return response
     
-    def _ask_which_database(self, matches: List[Dict], table_name: str) -> str:
-        """Ask user which database they mean when table exists in multiple."""
-        options = []
-        for i, match in enumerate(matches, 1):
-            options.append(f"{i}. Database: {match['database']}, Table: {match['table']}")
+    def _handle_table_not_found_in_sql(self, error_msg: str, user_query: str) -> str:
+        """Handle table not found during SQL execution."""
+        # Try to find table in other databases
+        import re
+        match = re.search(r"Table '([^']+)'", error_msg)
+        if match:
+            table_name = match.group(1)
+            matches = self.introspector.find_table_across_all_databases(table_name)
+            
+            if len(matches) == 1:
+                # Found in one database - switch and suggest retry
+                match = matches[0]
+                return (
+                    f"Table '{table_name}' not found in current database.\n"
+                    f"It exists in database '{match['database']}'.\n"
+                    f"Switch to that database and retry your query."
+                )
+            elif len(matches) > 1:
+                options = "\n".join([f"- {m['database']}" for m in matches])
+                return (
+                    f"Table '{table_name}' not found in current database.\n"
+                    f"It exists in multiple databases:\n{options}\n"
+                    f"Please specify which database to use."
+                )
         
-        options_text = "\n".join(options)
-        return f"Table '{table_name}' found in multiple databases. Which one do you mean?\n\n{options_text}\n\nPlease specify with 'show schema for <table> in <database>'"
+        return error_msg
     
     def _get_schema_for_table(self, database: str, table_name: str) -> Tuple[str, Optional[str]]:
-        """Get schema for a specific table in a specific database."""
+        """Get schema for a specific table."""
         try:
-            # Switch to the database temporarily
-            original_db = self.current_database
+            # Switch to database
             db_connection.set_active_database(database)
             self.current_database = database
             
@@ -285,7 +392,6 @@ class EmendoAIAgent:
             if not schema:
                 return f"Table '{table_name}' exists but has no columns in database '{database}'.", None
             
-            # Format schema
             schema_lines = []
             for col in schema:
                 nullable = "NULL" if col["nullable"] else "NOT NULL"
@@ -301,7 +407,6 @@ class EmendoAIAgent:
     
     def _switch_database(self, database: str) -> Tuple[str, Optional[str]]:
         """Switch to a different database with fuzzy matching."""
-        # Try to find the database
         found_db = self.introspector.find_database(database)
         
         if not found_db:
@@ -344,8 +449,11 @@ class EmendoAIAgent:
         database: Optional[str] = None,
         user_query: str = None
     ) -> Optional[Tuple[List[Dict], List[str], int, str]]:
-        """Execute SQL with intelligent error handling and retry."""
+        """Execute SQL with intelligent handling."""
         target_db = database or self.current_database
+        
+        # PART 6: Log active database
+        logger.info(f"Executing on database: {target_db}")
         
         if self.enable_intelligent_retry:
             result = self.executor.execute_with_intelligent_retry(
@@ -359,7 +467,7 @@ class EmendoAIAgent:
             results, columns, final_sql_or_error = result
             
             if results is None:
-                return (final_sql_or_error, [], 0, sql)
+                return final_sql_or_error
             
             return (results, columns, len(results), final_sql_or_error)
         
@@ -370,7 +478,7 @@ class EmendoAIAgent:
         sql: str, 
         database: Optional[str] = None
     ) -> Optional[Tuple[List[Dict], List[str], int, str]]:
-        """Execute SQL with simple retry logic."""
+        """Execute SQL with simple retry."""
         
         for attempt in range(self.max_execution_retries):
             try:
@@ -386,7 +494,7 @@ class EmendoAIAgent:
             except Exception as e:
                 logger.error(f"Execution attempt {attempt + 1} failed: {e}")
                 if attempt == self.max_execution_retries - 1:
-                    return (str(e), [], 0, sql)
+                    return str(e)
                 continue
         
         return None

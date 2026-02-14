@@ -86,18 +86,10 @@ def interactive_mode(agent):
                     print(f"\n❌ Error: {e}")
                 continue
             
-            # Check for special commands
-            if user_input.lower().startswith('show schema '):
-                table_name = user_input[len('show schema '):].strip()
-                try:
-                    schema = agent.get_table_schema(table_name, current_db)
-                    print(f"\n📝 Schema for '{table_name}':")
-                    for col in schema:
-                        nullable = "NULL" if col['nullable'] else "NOT NULL"
-                        print(f"   - {col['name']}: {col['type']} ({nullable})")
-                except Exception as e:
-                    print(f"\n❌ Error: {e}")
-                continue
+            # Check for special commands - delegate to agent for proper handling
+            if user_input.lower().startswith('show schema ') or user_input.lower().endswith(' schema'):
+                # Let the agent handle schema commands properly
+                pass  # Fall through to agent.process_query
             
             # Process regular query
             print("\n🤔 Processing...")

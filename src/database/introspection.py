@@ -4,6 +4,7 @@ Provides methods to list databases, tables, and schemas
 """
 from typing import List, Dict, Any, Optional
 import logging
+import re
 from difflib import SequenceMatcher
 
 from src.database.connection import db_connection
@@ -13,9 +14,45 @@ logger = logging.getLogger(__name__)
 # System databases to exclude
 SYSTEM_DATABASES = {'template0', 'template1', 'postgres'}
 
+# Cache for database -> tables mapping
+_db_table_cache: Dict[str, List[str]] = {}
+_cache_valid = False
+
+
+def _normalize(text: str) -> str:
+    """Normalize text for fuzzy matching: lowercase, remove spaces, hyphens, underscores"""
+    return text.lower().replace(' ', '').replace('-', '').replace('_', '')
+
 
 class SchemaIntrospector:
     """Handles database schema introspection"""
+    
+    def refresh_cache(self) -> None:
+        """Build cached mapping of database -> tables"""
+        global _db_table_cache, _cache_valid
+        _db_table_cache = {}
+        
+        try:
+            databases = self.list_databases(include_system=True)
+            for db in databases:
+                try:
+                    tables = self.list_tables(db)
+                    _db_table_cache[db] = tables
+                except Exception as e:
+                    logger.warning(f"Could not get tables from {db}: {e}")
+                    _db_table_cache[db] = []
+            _cache_valid = True
+            logger.info(f"Database cache refreshed: {len(_db_table_cache)} databases")
+        except Exception as e:
+            logger.error(f"Failed to refresh cache: {e}")
+            _cache_valid = False
+    
+    def get_cached_tables(self) -> Dict[str, List[str]]:
+        """Get cached database -> tables mapping"""
+        global _cache_valid
+        if not _cache_valid:
+            self.refresh_cache()
+        return _db_table_cache
     
     def list_databases(self, include_system: bool = False) -> List[str]:
         """List all databases on the PostgreSQL server"""
@@ -23,6 +60,7 @@ class SchemaIntrospector:
         try:
             conn = db_connection.get_connection()
             cursor = conn.cursor()
+            # PART 1: Standardized query - filter by datistemplate = false
             cursor.execute("""
                 SELECT datname 
                 FROM pg_database 
@@ -46,24 +84,19 @@ class SchemaIntrospector:
     def find_database(self, name: str) -> Optional[str]:
         """
         Find a database by name with fuzzy matching.
-        
-        Args:
-            name: Database name (can be partial, case-insensitive)
-            
-        Returns:
-            Exact database name if found, None otherwise
+        PART 7: Fuzzy Database Matching - normalize and match
         """
         databases = self.list_databases(include_system=True)
-        name_lower = name.lower()
+        normalized_input = _normalize(name)
         
-        # Exact match (case-insensitive)
+        # Exact match (case-insensitive, normalized)
         for db in databases:
-            if db.lower() == name_lower:
+            if _normalize(db) == normalized_input:
                 return db
         
-        # Partial match
+        # Partial match (normalized)
         for db in databases:
-            if name_lower in db.lower() or db.lower() in name_lower:
+            if normalized_input in _normalize(db) or _normalize(db) in normalized_input:
                 return db
         
         # Fuzzy match
@@ -71,7 +104,7 @@ class SchemaIntrospector:
         best_ratio = 0.0
         
         for db in databases:
-            ratio = SequenceMatcher(None, name_lower, db.lower()).ratio()
+            ratio = SequenceMatcher(None, normalized_input, _normalize(db)).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_match = db
@@ -103,27 +136,18 @@ class SchemaIntrospector:
                 db_connection.release_connection(conn)
     
     def find_table(self, table_name: str, database: Optional[str] = None) -> Optional[str]:
-        """
-        Find a table by name with fuzzy matching.
-        
-        Args:
-            table_name: Table name (can be partial)
-            database: Optional database to search in
-            
-        Returns:
-            Exact table name if found, None otherwise
-        """
+        """Find a table by name with fuzzy matching."""
         tables = self.list_tables(database)
-        table_lower = table_name.lower()
+        normalized_input = _normalize(table_name)
         
         # Exact match
         for t in tables:
-            if t.lower() == table_lower:
+            if _normalize(t) == normalized_input:
                 return t
         
         # Partial match
         for t in tables:
-            if table_lower in t.lower() or t.lower() in table_lower:
+            if normalized_input in _normalize(t) or _normalize(t) in normalized_input:
                 return t
         
         # Fuzzy match
@@ -131,7 +155,7 @@ class SchemaIntrospector:
         best_ratio = 0.0
         
         for t in tables:
-            ratio = SequenceMatcher(None, table_lower, t.lower()).ratio()
+            ratio = SequenceMatcher(None, normalized_input, _normalize(t)).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_match = t
@@ -147,15 +171,14 @@ class SchemaIntrospector:
         try:
             conn = db_connection.get_connection(database)
             cursor = conn.cursor()
+            # PART 3: Standardized schema query
             cursor.execute("""
                 SELECT 
                     column_name,
                     data_type,
-                    is_nullable,
-                    column_default,
                     character_maximum_length,
-                    numeric_precision,
-                    numeric_scale
+                    is_nullable,
+                    column_default
                 FROM information_schema.columns
                 WHERE table_name = %s 
                     AND table_schema = 'public'
@@ -167,11 +190,9 @@ class SchemaIntrospector:
                 columns.append({
                     "name": row[0],
                     "type": row[1],
-                    "nullable": row[2] == "YES",
-                    "default": row[3],
-                    "max_length": row[4],
-                    "precision": row[5],
-                    "scale": row[6]
+                    "max_length": row[2],
+                    "nullable": row[3] == "YES",
+                    "default": row[4]
                 })
             return columns
         except Exception as e:
@@ -190,38 +211,25 @@ class SchemaIntrospector:
     
     def find_table_across_all_databases(self, table_name: str) -> List[Dict[str, Any]]:
         """
-        Search for a table across all databases.
-        
-        Args:
-            table_name: Table name to search for
-            
-        Returns:
-            List of dicts with 'database' and 'table' keys
+        PART 2: Search for a table across all databases using cache.
+        Returns list of {database, table} for matches.
         """
-        databases = self.list_databases(include_system=True)
-        results = []
+        # Refresh cache to ensure latest data
+        self.refresh_cache()
         
-        for db in databases:
-            try:
-                tables = self.list_tables(database=db)
-                table_lower = table_name.lower()
-                
-                # Check for exact or partial match
-                for t in tables:
-                    if t.lower() == table_lower or table_lower in t.lower() or t.lower() in table_lower:
-                        results.append({
-                            "database": db,
-                            "table": t
-                        })
-                        break  # Only one match per database
-            except Exception as e:
-                logger.warning(f"Could not check database {db}: {e}")
-                continue
+        results = []
+        normalized_input = _normalize(table_name)
+        
+        for db, tables in _db_table_cache.items():
+            for t in tables:
+                if _normalize(t) == normalized_input:
+                    results.append({"database": db, "table": t})
+                    break  # One match per database
         
         return results
     
     def find_table_in_databases(self, table_name: str) -> List[Dict[str, Any]]:
-        """Find a table across all databases (alias for backward compatibility)"""
+        """Alias for backward compatibility"""
         return self.find_table_across_all_databases(table_name)
     
     def get_database_info(self, database: Optional[str] = None) -> Dict[str, Any]:
