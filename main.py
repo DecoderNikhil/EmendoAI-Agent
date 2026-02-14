@@ -137,9 +137,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py --query "List all databases"
-  python main.py --query "Show tables in myapp"
-  python main.py --query "Get all users from New York"
+  # Use Claude CLI (temporary demo)
+  python main.py --client cli --query "List all databases"
+  
+  # Use Amazon Bedrock
+  python main.py --client bedrock --query "Show tables in myapp"
+  
+  # Use Anthropic API (default/future production)
+  python main.py --client anthropic --api-key YOUR_KEY --query "Get all users"
+  
+  # Interactive mode
   python main.py --interactive
         """
     )
@@ -164,10 +171,39 @@ Examples:
     )
     
     parser.add_argument(
+        '--client', '-c',
+        type=str,
+        choices=['cli', 'bedrock', 'anthropic'],
+        default=None,
+        help='LLM client to use: cli (Claude CLI), bedrock (AWS Bedrock), anthropic (direct API)'
+    )
+    
+    parser.add_argument(
         '--api-key',
         type=str,
         default=None,
-        help='Anthropic API key (optional, can use ANTHROPIC_API_KEY env var)'
+        help='Anthropic API key (for anthropic client)'
+    )
+    
+    parser.add_argument(
+        '--aws-access-key-id',
+        type=str,
+        default=None,
+        help='AWS Access Key ID (for bedrock client)'
+    )
+    
+    parser.add_argument(
+        '--aws-secret-access-key',
+        type=str,
+        default=None,
+        help='AWS Secret Access Key (for bedrock client)'
+    )
+    
+    parser.add_argument(
+        '--region',
+        type=str,
+        default=None,
+        help='AWS Region (for bedrock client, default: us-east-1)'
     )
     
     args = parser.parse_args()
@@ -175,20 +211,43 @@ Examples:
     # Print banner
     print_banner()
     
-    # Check for API key
-    api_key = args.api_key or settings.ANTHROPIC_API_KEY
+    # Determine client type
+    force_client = args.client
     
-    if not api_key:
-        print("\n❌ Error: ANTHROPIC_API_KEY is required.")
-        print("   Set it via:")
-        print("   - Command line: --api-key YOUR_KEY")
-        print("   - Environment: export ANTHROPIC_API_KEY=YOUR_KEY")
-        print("   - .env file: ANTHROPIC_API_KEY=YOUR_KEY")
-        sys.exit(1)
+    # Validate required credentials based on client
+    if force_client == 'bedrock' or (force_client is None and settings.USE_BEDROCK):
+        # Bedrock requires AWS credentials
+        aws_access_key_id = args.aws_access_key_id or settings.AWS_ACCESS_KEY_ID
+        aws_secret_access_key = args.aws_secret_access_key or settings.AWS_SECRET_ACCESS_KEY
+        region_name = args.region or settings.AWS_REGION
+        
+        if not aws_access_key_id or not aws_secret_access_key:
+            print("\n❌ Error: AWS credentials required for Bedrock client.")
+            print("   Set them via:")
+            print("   - Command line: --aws-access-key-id KEY --aws-secret-access-key SECRET")
+            print("   - Environment: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
+            sys.exit(1)
+    elif force_client == 'anthropic' or force_client is None:
+        # Anthropic API requires API key (unless USE_CLAUDE_CLI is set)
+        api_key = args.api_key or settings.ANTHROPIC_API_KEY
+        
+        if not api_key and not settings.USE_CLAUDE_CLI:
+            print("\n❌ Error: Anthropic API key required.")
+            print("   Set it via:")
+            print("   - Command line: --api-key YOUR_KEY")
+            print("   - Environment: ANTHROPIC_API_KEY")
+            print("   Or use --client cli for Claude CLI mode")
+            sys.exit(1)
     
     # Create agent
     try:
-        agent = create_agent(api_key)
+        agent = create_agent(
+            force_client=force_client,
+            api_key=args.api_key,
+            aws_access_key_id=args.aws_access_key_id,
+            aws_secret_access_key=args.aws_secret_access_key,
+            region_name=args.region
+        )
         print("\n✅ Agent initialized successfully!")
     except Exception as e:
         print(f"\n❌ Error initializing agent: {e}")

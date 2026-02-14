@@ -8,6 +8,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Stop words to ignore when extracting table names
+SCHEMA_STOP_WORDS = {
+    'for', 'of', 'the', 'a', 'an', 'in', 'to', 'from', 'with',
+    'table', 'tables', 'schema', 'describe', 'show'
+}
+
 
 class ResponseParser:
     """Parses LLM responses to extract SQL and other information"""
@@ -51,6 +57,201 @@ class ResponseParser:
             return cleaned
         
         return None
+    
+    def extract_table_name_from_schema_command(self, user_input: str) -> Optional[str]:
+        """
+        Extract table name from schema-related commands.
+        
+        Handles variations like:
+        - "show schema users"
+        - "show schema for users"
+        - "show schema of users"
+        - "describe users"
+        - "show tables in database"
+        
+        Args:
+            user_input: The natural language input from user
+            
+        Returns:
+            Extracted table name or None
+        """
+        # Normalize input
+        normalized = user_input.lower().strip()
+        
+        # Skip common prefixes that aren't table names
+        # First, check if this is a schema/describe command at all
+        schema_patterns = [
+            r'^show\s+schema\s+(?:for\s+|of\s+)?(.+)',
+            r'^describe\s+(?:table\s+)?(.+)',
+            r'^desc\s+(?:table\s+)?(.+)',
+            r'^show\s+tables?\s+(?:in|from|of)\s+(.+)',
+            r'^list\s+tables?\s+(?:in|from|of)\s+(.+)',
+        ]
+        
+        for pattern in schema_patterns:
+            match = re.match(pattern, normalized)
+            if match:
+                # Get the captured group - this should have our table/database
+                captured = match.group(1).strip()
+                
+                # Now extract the last meaningful token from what was captured
+                table_name = self._extract_last_token(captured)
+                
+                if table_name:
+                    logger.debug(f"Extracted table name '{table_name}' from schema command")
+                    return table_name
+        
+        # Fallback: look for any table-like word in the input
+        # This catches edge cases
+        words = normalized.split()
+        meaningful_words = [w for w in words if w not in SCHEMA_STOP_WORDS]
+        
+        if meaningful_words:
+            # Return the last meaningful word - it's most likely the table name
+            return meaningful_words[-1]
+        
+        return None
+    
+    def _extract_last_token(self, text: str) -> Optional[str]:
+        """
+        Extract the last meaningful token from text.
+        
+        This handles cases like "for users" where we want "users",
+        or "in my_database" where we want "my_database".
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Last meaningful token or None
+        """
+        # Split into tokens
+        tokens = text.split()
+        
+        # Filter out stop words
+        meaningful_tokens = [t for t in tokens if t.lower() not in SCHEMA_STOP_WORDS]
+        
+        if not meaningful_tokens:
+            # If all tokens are stop words, use the original last token
+            if tokens:
+                return tokens[-1]
+            return None
+        
+        # Return the last meaningful token
+        return meaningful_tokens[-1]
+    
+    def extract_database_name(self, user_input: str) -> Optional[str]:
+        """
+        Extract database name from user input.
+        
+        Handles variations like:
+        - "list tables in mydb"
+        - "use my_database"
+        - "switch to production"
+        
+        Args:
+            user_input: The natural language input from user
+            
+        Returns:
+            Extracted database name or None
+        """
+        normalized = user_input.lower().strip()
+        
+        # Patterns for database extraction
+        db_patterns = [
+            r'(?:in|from|use|switch to|connect to)\s+(\w+)',
+            r'(?:database|db)\s+(\w+)',
+            r'^(\w+)\s+(?:database|tables)',  # "mydb tables"
+        ]
+        
+        for pattern in db_patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                db_name = match.group(1).strip()
+                # Filter out common non-database words
+                if db_name not in ['list', 'show', 'get', 'all', 'the']:
+                    return db_name
+        
+        return None
+    
+    def is_schema_command(self, user_input: str) -> bool:
+        """
+        Check if the user input is a schema-related command.
+        
+        Args:
+            user_input: User's natural language input
+            
+        Returns:
+            True if it's a schema command, False otherwise
+        """
+        normalized = user_input.lower().strip()
+        
+        schema_keywords = [
+            'show schema', 'describe', 'desc ',
+            'show tables', 'list tables',
+            'show columns', 'list columns'
+        ]
+        
+        return any(keyword in normalized for keyword in schema_keywords)
+    
+    def is_database_switch_command(self, user_input: str) -> bool:
+        """
+        Check if the user input is a database switch command.
+        
+        Args:
+            user_input: User's natural language input
+            
+        Returns:
+            True if it's a database switch command, False otherwise
+        """
+        normalized = user_input.lower().strip()
+        
+        switch_keywords = [
+            'use ', 'switch to', 'connect to',
+            'change database', 'change db'
+        ]
+        
+        return any(keyword in normalized for keyword in switch_keywords)
+    
+    def is_list_databases_command(self, user_input: str) -> bool:
+        """
+        Check if the user wants to list databases.
+        
+        Args:
+            user_input: User's natural language input
+            
+        Returns:
+            True if it's a list databases command
+        """
+        normalized = user_input.lower().strip()
+        
+        list_db_patterns = [
+            r'^list\s+databases?',
+            r'^show\s+databases?',
+            r'^get\s+databases?'
+        ]
+        
+        return any(re.match(pattern, normalized) for pattern in list_db_patterns)
+    
+    def is_list_tables_command(self, user_input: str) -> bool:
+        """
+        Check if the user wants to list tables.
+        
+        Args:
+            user_input: User's natural language input
+            
+        Returns:
+            True if it's a list tables command
+        """
+        normalized = user_input.lower().strip()
+        
+        list_table_patterns = [
+            r'^list\s+tables?',
+            r'^show\s+tables?',
+            r'^get\s+tables?'
+        ]
+        
+        return any(re.match(pattern, normalized) for pattern in list_table_patterns)
     
     def _looks_like_sql(self, text: str) -> bool:
         """Check if text looks like a SQL query"""
